@@ -1,0 +1,1 @@
+ultralytics opencv-python mediapipe numpy scipy filterpy fastapi uvicorn torch torchvision
