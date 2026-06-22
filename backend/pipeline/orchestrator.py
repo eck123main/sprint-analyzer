@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../core"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../utils"))
 
 from video_processor import extract_frames, get_video_metadata
 from detector import load_model, detect_people, Detection
@@ -17,6 +18,7 @@ from homography import (
     CameraMotionTracker,
 )
 from speed_calculator import calculate_speed_profile, predict_winner, compare_athletes_at_time
+from occlusion_handler import OcclusionHandler
 
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "../../data/calibration/last_calibration.json")
@@ -135,6 +137,11 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
     # before converting pixels to world coordinates.
     motion_tracker = CameraMotionTracker(calibration_frame)
 
+    # Detects bbox overlaps between athletes and corrects likely ID swaps
+    # (e.g. two sprinters crossing paths from a side-on camera) using lane
+    # position consistency. See utils/occlusion_handler.py.
+    occlusion_handler = OcclusionHandler()
+
     # Latest per-frame display info only: {track_id: {bbox, hip, speed_mps, distance_m}}
     # World-space position HISTORY now lives entirely on the tracker
     # (TrackedAthlete.position_history), not in a separate dict here.
@@ -153,6 +160,16 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
         detections = detect_people(yolo_model, frame)
         athletes = tracker.update(detections, frame_idx, timestamp)
 
+        # Which IDs are in (or just came out of) a bbox overlap this frame —
+        # only these are eligible for ID-swap correction below.
+        suspect_ids = occlusion_handler.note_occlusion_candidates(detections)
+
+        # PASS 1: compute hip position + world coords for every detection
+        # this frame, without writing anything yet — the swap-correction
+        # step needs to see everyone's position in this frame at once.
+        raw_world_positions = {}   # tid -> (world_x, world_y)
+        per_det_info = {}          # tid -> {bbox, hip_x, hip_y}
+
         for det in detections:
             tid = det.track_id
             keypoints = get_hip_position(pose_model, frame, det.bbox)
@@ -170,13 +187,27 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
             ref_x, ref_y = motion_tracker.map_to_reference(hip_x, hip_y)
             world_x, world_y = transformer.pixel_to_world(ref_x, ref_y)
 
-            # Single write path for world-space history — tracker owns it now.
-            tracker.update_world_position(tid, frame_idx, timestamp, world_x, world_y)
+            raw_world_positions[tid] = (world_x, world_y)
+            per_det_info[tid] = {"bbox": det.bbox, "hip": (hip_x, hip_y)}
 
-            # Quick instantaneous speed from last 2 points for live display,
-            # read straight off the tracker's history instead of a duplicate dict.
+        # PASS 2: resolve likely ID swaps among this frame's positions,
+        # using lane consistency. id_mapping is identity for anyone not
+        # under suspicion this frame.
+        id_mapping = occlusion_handler.update_and_correct(
+            raw_world_positions, frame_idx, timestamp, suspect_ids
+        )
+
+        # PASS 3: write world history and live-display info under the
+        # CORRECTED id, so a swap doesn't graft one athlete's data onto
+        # another's history.
+        for original_tid, (world_x, world_y) in raw_world_positions.items():
+            corrected_tid = id_mapping.get(original_tid, original_tid)
+            info = per_det_info[original_tid]
+
+            tracker.update_world_position(corrected_tid, frame_idx, timestamp, world_x, world_y)
+
             speed_mps = 0.0
-            hist = tracker.athletes[tid].position_history
+            hist = tracker.athletes[corrected_tid].position_history
             if len(hist) >= 2:
                 p1, p2 = hist[-2], hist[-1]
                 dt = p2[1] - p1[1]
@@ -184,9 +215,9 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
                     dist = np.sqrt((p2[2] - p1[2]) ** 2 + (p2[3] - p1[3]) ** 2)
                     speed_mps = dist / dt
 
-            latest_display[tid] = {
-                "bbox": det.bbox,
-                "hip": (hip_x, hip_y),
+            latest_display[corrected_tid] = {
+                "bbox": info["bbox"],
+                "hip": info["hip"],
                 "speed_mps": speed_mps,
                 "distance_m": world_x
             }
@@ -199,6 +230,9 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
 
     cv2.destroyAllWindows()
     pose_model.close()
+
+    print("\n=== Occlusion / ID-Swap Report ===\n")
+    print(occlusion_handler.report())
 
     print("\n=== Final Analysis ===\n")
     profiles = []
