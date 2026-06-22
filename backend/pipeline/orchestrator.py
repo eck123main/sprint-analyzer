@@ -10,19 +10,34 @@ from video_processor import extract_frames, get_video_metadata
 from detector import load_model, detect_people, Detection
 from tracker import AthleteTracker
 from pose_estimator import load_pose_model, get_hip_position
-from homography import HomographyTransformer, CalibrationPoints, pick_calibration_points_interactive
+from homography import (
+    HomographyTransformer,
+    CalibrationPoints,
+    pick_calibration_points_interactive,
+    CameraMotionTracker,
+)
 from speed_calculator import calculate_speed_profile, predict_winner, compare_athletes_at_time
 
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "../../data/calibration/last_calibration.json")
 
 
-def run_calibration_step(video_path: str) -> HomographyTransformer:
+def run_calibration_step(video_path: str):
     """
     Pauses on the first frame, lets you click calibration points,
     then asks for real-world distances for each point.
     Saves calibration to disk so you don't have to redo it every run.
+
+    Returns (HomographyTransformer, calibration_frame). The calibration
+    frame is also needed to seed CameraMotionTracker, since that's the
+    reference frame all later frames get corrected back to.
     """
+    cap = cv2.VideoCapture(video_path)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise ValueError("Could not read first frame for calibration")
+
     if os.path.exists(CALIBRATION_FILE):
         use_saved = input("Saved calibration found. Use it? (y/n): ").strip().lower()
         if use_saved == "y":
@@ -34,13 +49,7 @@ def run_calibration_step(video_path: str) -> HomographyTransformer:
             )
             transformer = HomographyTransformer(calib)
             print(transformer.calibration_report())
-            return transformer
-
-    cap = cv2.VideoCapture(video_path)
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        raise ValueError("Could not read first frame for calibration")
+            return transformer, frame
 
     print("\nClick on points where you know the real-world distance (e.g. start line, "
           "10m marks, finish line). Click at least 4 points, 6+ recommended.")
@@ -78,7 +87,7 @@ def run_calibration_step(video_path: str) -> HomographyTransformer:
         }, f, indent=2)
     print(f"Calibration saved to {CALIBRATION_FILE}\n")
 
-    return transformer
+    return transformer, frame
 
 
 def draw_overlay(frame, athletes_data, frame_idx, timestamp):
@@ -119,15 +128,28 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
     pose_model = load_pose_model()
     tracker = AthleteTracker(max_missing_frames=10)
 
-    transformer = run_calibration_step(video_path)
+    transformer, calibration_frame = run_calibration_step(video_path)
 
-    # latest_display stays — it's just per-frame UI state, not history
+    # Corrects for camera pan/zoom/drift by tracking static background
+    # features and mapping every later frame back to the calibration frame
+    # before converting pixels to world coordinates.
+    motion_tracker = CameraMotionTracker(calibration_frame)
+
+    # Latest per-frame display info only: {track_id: {bbox, hip, speed_mps, distance_m}}
+    # World-space position HISTORY now lives entirely on the tracker
+    # (TrackedAthlete.position_history), not in a separate dict here.
     latest_display = {}
 
     meta = get_video_metadata(video_path)
     print(f"\nProcessing {meta.frame_count} frames @ {meta.fps}fps...\n")
 
     for frame_idx, timestamp, frame in extract_frames(video_path, skip_frames=skip_frames):
+        # Update camera motion estimate every frame, BEFORE using it below
+        motion_tracker.update(frame)
+        if motion_tracker.last_inlier_ratio < 0.5:
+            print(f"  WARNING frame {frame_idx}: low motion-tracking confidence "
+                  f"({motion_tracker.last_inlier_ratio:.2f}) — camera correction may be unreliable")
+
         detections = detect_people(yolo_model, frame)
         athletes = tracker.update(detections, frame_idx, timestamp)
 
@@ -136,23 +158,30 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
             keypoints = get_hip_position(pose_model, frame, det.bbox)
 
             if keypoints is None or keypoints.visibility < 0.4:
+                # Low confidence — fall back to bbox centre, mark it as such
                 hip_x, hip_y = det.center_x, det.center_y
             else:
                 hip_x, hip_y = keypoints.hip_x, keypoints.hip_y
 
-            world_x, world_y = transformer.pixel_to_world(hip_x, hip_y)
+            # Correct for camera motion BEFORE converting to world coords —
+            # maps this frame's pixel back into the calibration frame's
+            # pixel space, so the static homography still applies correctly
+            # even if the camera panned/zoomed since calibration.
+            ref_x, ref_y = motion_tracker.map_to_reference(hip_x, hip_y)
+            world_x, world_y = transformer.pixel_to_world(ref_x, ref_y)
 
-            # single write path now — tracker owns world history
+            # Single write path for world-space history — tracker owns it now.
             tracker.update_world_position(tid, frame_idx, timestamp, world_x, world_y)
 
-            # quick instantaneous speed from last 2 points, read straight off the tracker
+            # Quick instantaneous speed from last 2 points for live display,
+            # read straight off the tracker's history instead of a duplicate dict.
             speed_mps = 0.0
             hist = tracker.athletes[tid].position_history
             if len(hist) >= 2:
                 p1, p2 = hist[-2], hist[-1]
                 dt = p2[1] - p1[1]
                 if dt > 0:
-                    dist = np.sqrt((p2[2]-p1[2])**2 + (p2[3]-p1[3])**2)
+                    dist = np.sqrt((p2[2] - p1[2]) ** 2 + (p2[3] - p1[3]) ** 2)
                     speed_mps = dist / dt
 
             latest_display[tid] = {
@@ -173,7 +202,10 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
 
     print("\n=== Final Analysis ===\n")
     profiles = []
-    for tid, athlete in tracker.athletes.items():
+    # all_athletes_ever_tracked() includes both still-active AND archived
+    # athletes, so a brief occlusion or finishing the race and leaving
+    # frame doesn't silently drop someone's data from the final report.
+    for tid, athlete in tracker.all_athletes_ever_tracked().items():
         profile = calculate_speed_profile(tid, athlete.position_history)
         profiles.append(profile)
         print(f"Athlete {tid}:")
@@ -185,6 +217,7 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
     if profiles:
         prediction = predict_winner(profiles, race_distance_m=100.0)
         print("Winner prediction:", prediction)
+
 
 if __name__ == "__main__":
     sample_dir = os.path.join(os.path.dirname(__file__), "../../data/sample_videos")

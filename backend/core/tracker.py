@@ -16,10 +16,19 @@ class TrackedAthlete:
 
 class AthleteTracker:
     def __init__(self, max_missing_frames: int = 10):
+        """
+        max_missing_frames: how many frames an athlete can disappear
+        before we consider them truly gone (not just occluded)
+        """
         self.athletes: dict[int, TrackedAthlete] = {}
+        self.archived_athletes: dict[int, TrackedAthlete] = {}
         self.max_missing_frames = max_missing_frames
 
     def update(self, detections, frame_idx: int, timestamp: float) -> dict[int, TrackedAthlete]:
+        """
+        Feed in detections from detector.py for this frame.
+        Returns current active athletes with stable IDs.
+        """
         seen_ids = set()
 
         for det in detections:
@@ -27,6 +36,7 @@ class AthleteTracker:
             seen_ids.add(tid)
 
             if tid not in self.athletes:
+                # New athlete
                 self.athletes[tid] = TrackedAthlete(
                     track_id=tid,
                     center_x=det.center_x,
@@ -35,6 +45,7 @@ class AthleteTracker:
                     confidence=det.confidence
                 )
 
+            # Update position
             athlete = self.athletes[tid]
             athlete.center_x = det.center_x
             athlete.center_y = det.center_y
@@ -45,6 +56,7 @@ class AthleteTracker:
             # It now exclusively holds WORLD coordinates, pushed via
             # update_world_position() once homography has resolved them.
 
+        # Increment missing counter for athletes not seen this frame
         to_remove = []
         for tid, athlete in self.athletes.items():
             if tid not in seen_ids:
@@ -52,8 +64,10 @@ class AthleteTracker:
                 if athlete.frames_missing > self.max_missing_frames:
                     to_remove.append(tid)
 
+        # Archive instead of deleting outright, so a brief occlusion or
+        # finishing the race and leaving frame doesn't lose history data.
         for tid in to_remove:
-            del self.athletes[tid]
+            self.archived_athletes[tid] = self.athletes.pop(tid)
 
         return self.athletes
 
@@ -61,8 +75,8 @@ class AthleteTracker:
                                 world_x: float, world_y: float) -> None:
         """
         Call this after running detections through the homography transformer.
-        This is the single place world-space history gets recorded — the
-        orchestrator should not keep its own separate history dict anymore.
+        This is the single place world-space history gets recorded — don't
+        keep a separate history dict anywhere else.
         """
         if track_id in self.athletes:
             self.athletes[track_id].position_history.append(
@@ -71,6 +85,11 @@ class AthleteTracker:
 
     def get_active_athletes(self) -> list[TrackedAthlete]:
         return list(self.athletes.values())
+
+    def all_athletes_ever_tracked(self) -> dict[int, TrackedAthlete]:
+        """Active + archived — use this for final reporting so brief
+        occlusions or end-of-race exits don't silently drop someone's data."""
+        return {**self.archived_athletes, **self.athletes}
 
     def summary(self) -> str:
         lines = [f"Tracking {len(self.athletes)} athletes:"]
@@ -113,5 +132,5 @@ if __name__ == "__main__":
         cv2.destroyAllWindows()
         print("\n=== Final Summary ===")
         print(tracker.summary())
-        for tid, athlete in tracker.athletes.items():
+        for tid, athlete in tracker.all_athletes_ever_tracked().items():
             print(f"Athlete {tid}: tracked for {len(athlete.position_history)} frames")

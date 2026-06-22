@@ -72,6 +72,74 @@ class HomographyTransformer:
         return "\n".join(lines)
 
 
+class CameraMotionTracker:
+    """
+    Tracks camera motion (pan/zoom/drift) across frames by following static
+    background features — track lines, lane markers, anything that doesn't
+    move with the runners — and accumulates a homography that maps the
+    CURRENT frame's pixels back into calibration-frame pixel space.
+
+    Use this BEFORE calling HomographyTransformer.pixel_to_world() whenever
+    the camera isn't locked off. Calibrate once on frame 0, then correct
+    every later frame back to that reference before converting to world coords.
+    """
+    def __init__(self, reference_frame: np.ndarray, max_features: int = 200):
+        self.reference_gray = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+        self.max_features = max_features
+        self.prev_gray = self.reference_gray.copy()
+        self.prev_points = self._detect_features(self.prev_gray)
+        # Maps CURRENT frame pixel -> calibration (reference) frame pixel
+        self.cumulative_H = np.eye(3, dtype=np.float64)
+        self.frames_since_reseed = 0
+        self.reseed_interval = 30  # features drift out of frame, refresh periodically
+        self.last_inlier_ratio = 1.0  # exposed so caller can flag bad frames
+
+    def _detect_features(self, gray):
+        return cv2.goodFeaturesToTrack(
+            gray, maxCorners=self.max_features, qualityLevel=0.01, minDistance=10
+        )
+
+    def update(self, frame: np.ndarray) -> np.ndarray:
+        """Call once per frame, in frame order. Returns cumulative_H."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_points is None or len(self.prev_points) < 10:
+            self.prev_points = self._detect_features(self.prev_gray)
+            if self.prev_points is None:
+                self.prev_gray = gray
+                return self.cumulative_H
+
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, self.prev_points, None
+        )
+        status = status.reshape(-1)
+        good_prev = self.prev_points[status == 1]
+        good_next = next_points[status == 1]
+
+        if len(good_prev) >= 8:
+            H_step, inlier_mask = cv2.findHomography(good_next, good_prev, cv2.RANSAC, 3.0)
+            if H_step is not None:
+                self.cumulative_H = H_step @ self.cumulative_H
+                if inlier_mask is not None and len(inlier_mask) > 0:
+                    self.last_inlier_ratio = float(inlier_mask.sum()) / len(inlier_mask)
+
+        self.frames_since_reseed += 1
+        if self.frames_since_reseed >= self.reseed_interval or len(good_next) < 30:
+            self.prev_points = self._detect_features(gray)
+            self.frames_since_reseed = 0
+        else:
+            self.prev_points = good_next.reshape(-1, 1, 2)
+
+        self.prev_gray = gray
+        return self.cumulative_H
+
+    def map_to_reference(self, px: float, py: float) -> tuple:
+        """Map a pixel from the CURRENT frame back to calibration-frame pixel space."""
+        point = np.array([[[px, py]]], dtype=np.float32)
+        mapped = cv2.perspectiveTransform(point, self.cumulative_H.astype(np.float32))
+        return float(mapped[0][0][0]), float(mapped[0][0][1])
+
+
 def build_track_calibration_template() -> str:
     """
     Returns instructions for how to build calibration points for a running track.
@@ -141,6 +209,7 @@ def pick_calibration_points_interactive(frame: np.ndarray, num_points: int = 6) 
 
     cv2.destroyAllWindows()
     return points
+
 
 if __name__ == "__main__":
     print(build_track_calibration_template())
