@@ -121,9 +121,7 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
 
     transformer = run_calibration_step(video_path)
 
-    # Stores raw world-position history per athlete: {track_id: [(frame, ts, wx, wy), ...]}
-    world_history = {}
-    # Latest per-frame display info: {track_id: {bbox, hip, speed_mps, distance_m}}
+    # latest_display stays — it's just per-frame UI state, not history
     latest_display = {}
 
     meta = get_video_metadata(video_path)
@@ -138,20 +136,18 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
             keypoints = get_hip_position(pose_model, frame, det.bbox)
 
             if keypoints is None or keypoints.visibility < 0.4:
-                # Low confidence — fall back to bbox centre, mark it as such
                 hip_x, hip_y = det.center_x, det.center_y
             else:
                 hip_x, hip_y = keypoints.hip_x, keypoints.hip_y
 
             world_x, world_y = transformer.pixel_to_world(hip_x, hip_y)
 
-            if tid not in world_history:
-                world_history[tid] = []
-            world_history[tid].append((frame_idx, timestamp, world_x, world_y))
+            # single write path now — tracker owns world history
+            tracker.update_world_position(tid, frame_idx, timestamp, world_x, world_y)
 
-            # Quick instantaneous speed from last 2 points for live display
+            # quick instantaneous speed from last 2 points, read straight off the tracker
             speed_mps = 0.0
-            hist = world_history[tid]
+            hist = tracker.athletes[tid].position_history
             if len(hist) >= 2:
                 p1, p2 = hist[-2], hist[-1]
                 dt = p2[1] - p1[1]
@@ -177,8 +173,8 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
 
     print("\n=== Final Analysis ===\n")
     profiles = []
-    for tid, history in world_history.items():
-        profile = calculate_speed_profile(tid, history)
+    for tid, athlete in tracker.athletes.items():
+        profile = calculate_speed_profile(tid, athlete.position_history)
         profiles.append(profile)
         print(f"Athlete {tid}:")
         print(f"  Peak speed: {profile.peak_speed_mps:.2f} m/s ({profile.peak_speed_kmh:.1f} km/h)")
@@ -189,7 +185,6 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
     if profiles:
         prediction = predict_winner(profiles, race_distance_m=100.0)
         print("Winner prediction:", prediction)
-
 
 if __name__ == "__main__":
     sample_dir = os.path.join(os.path.dirname(__file__), "../../data/sample_videos")

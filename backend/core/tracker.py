@@ -10,22 +10,16 @@ class TrackedAthlete:
     bbox: tuple
     confidence: float
     frames_missing: int = 0
-    position_history: list = field(default_factory=list)  # list of (frame_idx, ts, cx, cy)
+    position_history: list = field(default_factory=list)
+    # list of (frame_idx, ts, world_x, world_y) — WORLD coords, not pixel.
+    # Populated via update_world_position(), not update().
 
 class AthleteTracker:
     def __init__(self, max_missing_frames: int = 10):
-        """
-        max_missing_frames: how many frames an athlete can disappear
-        before we consider them truly gone (not just occluded)
-        """
         self.athletes: dict[int, TrackedAthlete] = {}
         self.max_missing_frames = max_missing_frames
 
     def update(self, detections, frame_idx: int, timestamp: float) -> dict[int, TrackedAthlete]:
-        """
-        Feed in detections from detector.py for this frame.
-        Returns current active athletes with stable IDs.
-        """
         seen_ids = set()
 
         for det in detections:
@@ -33,7 +27,6 @@ class AthleteTracker:
             seen_ids.add(tid)
 
             if tid not in self.athletes:
-                # New athlete
                 self.athletes[tid] = TrackedAthlete(
                     track_id=tid,
                     center_x=det.center_x,
@@ -42,16 +35,16 @@ class AthleteTracker:
                     confidence=det.confidence
                 )
 
-            # Update position
             athlete = self.athletes[tid]
             athlete.center_x = det.center_x
             athlete.center_y = det.center_y
             athlete.bbox = det.bbox
             athlete.confidence = det.confidence
             athlete.frames_missing = 0
-            athlete.position_history.append((frame_idx, timestamp, det.center_x, det.center_y))
+            # NOTE: position_history is no longer touched here.
+            # It now exclusively holds WORLD coordinates, pushed via
+            # update_world_position() once homography has resolved them.
 
-        # Increment missing counter for athletes not seen this frame
         to_remove = []
         for tid, athlete in self.athletes.items():
             if tid not in seen_ids:
@@ -63,6 +56,18 @@ class AthleteTracker:
             del self.athletes[tid]
 
         return self.athletes
+
+    def update_world_position(self, track_id: int, frame_idx: int, timestamp: float,
+                                world_x: float, world_y: float) -> None:
+        """
+        Call this after running detections through the homography transformer.
+        This is the single place world-space history gets recorded — the
+        orchestrator should not keep its own separate history dict anymore.
+        """
+        if track_id in self.athletes:
+            self.athletes[track_id].position_history.append(
+                (frame_idx, timestamp, world_x, world_y)
+            )
 
     def get_active_athletes(self) -> list[TrackedAthlete]:
         return list(self.athletes.values())
