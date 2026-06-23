@@ -19,6 +19,13 @@ from homography import (
 )
 from speed_calculator import calculate_speed_profile, predict_winner, compare_athletes_at_time
 from occlusion_handler import OcclusionHandler
+from start_detector import (
+    StartDetectionResult,
+    detect_gun_shot,
+    detect_broadcast_timer_start,
+    detect_first_movement,
+    pick_roi_interactive,
+)
 
 
 CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "../../data/calibration/last_calibration.json")
@@ -92,6 +99,90 @@ def run_calibration_step(video_path: str):
     return transformer, frame
 
 
+def _prime_first_movement_estimate(video_path, yolo_model, pose_model, transformer,
+                                    prime_window_s: float = 5.0, skip_frames: int = 1) -> dict:
+    """
+    Last-resort priming pass, only run if gun audio AND broadcast timer both
+    fail to find a start. Runs detection+tracking on just the opening seconds
+    to build enough position history for detect_first_movement().
+
+    Uses a throwaway tracker and its OWN fresh CameraMotionTracker (seeded
+    on the same calibration frame) so it doesn't disturb the real motion
+    tracker used by the main loop below — these opening frames get
+    re-processed for real once run_pipeline knows the actual start_timestamp.
+    That's a small amount of duplicated compute, only paid when this
+    fallback is actually needed.
+    """
+    cap = cv2.VideoCapture(video_path)
+    ret, calibration_frame = cap.read()
+    cap.release()
+    if not ret:
+        return {}
+
+    priming_motion_tracker = CameraMotionTracker(calibration_frame)
+    prime_tracker = AthleteTracker(max_missing_frames=10)
+
+    for frame_idx, timestamp, frame in extract_frames(video_path, skip_frames=skip_frames):
+        if timestamp > prime_window_s:
+            break
+
+        priming_motion_tracker.update(frame)
+        detections = detect_people(yolo_model, frame)
+        prime_tracker.update(detections, frame_idx, timestamp)
+
+        for det in detections:
+            keypoints = get_hip_position(pose_model, frame, det.bbox)
+            if keypoints is None or keypoints.visibility < 0.4:
+                hip_x, hip_y = det.center_x, det.center_y
+            else:
+                hip_x, hip_y = keypoints.hip_x, keypoints.hip_y
+
+            ref_x, ref_y = priming_motion_tracker.map_to_reference(hip_x, hip_y)
+            world_x, world_y = transformer.pixel_to_world(ref_x, ref_y)
+            prime_tracker.update_world_position(det.track_id, frame_idx, timestamp, world_x, world_y)
+
+    return {tid: a.position_history for tid, a in prime_tracker.all_athletes_ever_tracked().items()}
+
+
+def determine_race_start(video_path: str, calibration_frame, yolo_model, pose_model,
+                          transformer) -> StartDetectionResult:
+    """
+    Runs the start-detection priority chain and returns whichever method
+    succeeded. Prints what it tried and why, so a fallback never happens
+    silently — you always know how trustworthy your t=0 is.
+    """
+    print("\nDetecting race start...")
+
+    gun_result = detect_gun_shot(video_path)
+    if gun_result:
+        return gun_result
+    print("  No gun-shot audio transient found (no audio track, ffmpeg missing, "
+          "or nothing spiked hard enough).")
+
+    use_timer = input("  Is there an on-screen race clock visible in this video? (y/n): ").strip().lower()
+    if use_timer == "y":
+        print("  Click the top-left then bottom-right corner of the clock, then press 'q'.")
+        timer_roi = pick_roi_interactive(calibration_frame)
+        if timer_roi is not None:
+            timer_result = detect_broadcast_timer_start(video_path, timer_roi)
+            if timer_result:
+                return timer_result
+            print("  Clock ROI selected but no clear start transition found in it.")
+
+    print("  Falling back to first-movement detection (less precise — "
+          "frame-rate limited, see start_detector.py for caveats).")
+    histories = _prime_first_movement_estimate(video_path, yolo_model, pose_model, transformer)
+    movement_result = detect_first_movement(histories)
+    if movement_result:
+        return movement_result
+
+    raise ValueError(
+        "Could not detect race start via gun audio, broadcast timer, or first "
+        "movement. Check your video/audio, or set a manual start_timestamp "
+        "before calling run_pipeline."
+    )
+
+
 def draw_overlay(frame, athletes_data, frame_idx, timestamp):
     """Draw bounding boxes, hip points, and live speed readouts on frame"""
     frame = frame.copy()
@@ -138,19 +229,39 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
     motion_tracker = CameraMotionTracker(calibration_frame)
 
     # Detects bbox overlaps between athletes and corrects likely ID swaps
-    # (e.g. two sprinters crossing paths from a side-on camera) using lane
-    # position consistency. See utils/occlusion_handler.py.
+    # using lane position consistency. See utils/occlusion_handler.py.
     occlusion_handler = OcclusionHandler()
 
+    # Gun audio -> broadcast timer -> first movement, in that priority order.
+    # start_result.start_timestamp gets subtracted from every later frame's
+    # timestamp below, so t=0 lines up with the actual start trigger instead
+    # of "frame 0 of the video file".
+    start_result = determine_race_start(video_path, calibration_frame, yolo_model, pose_model, transformer)
+    print(f"\nRace start: method='{start_result.method}' "
+          f"confidence={start_result.confidence:.2f}")
+    print(f"  {start_result.details}")
+    if start_result.method == "first_movement":
+        print("  NOTE: this is the frame-rate-limited fallback. Treat reaction-time "
+              "numbers from this run as approximate, not gun-precise.")
+    start_timestamp = start_result.start_timestamp
+
     # Latest per-frame display info only: {track_id: {bbox, hip, speed_mps, distance_m}}
-    # World-space position HISTORY now lives entirely on the tracker
+    # World-space position HISTORY lives entirely on the tracker
     # (TrackedAthlete.position_history), not in a separate dict here.
     latest_display = {}
 
     meta = get_video_metadata(video_path)
     print(f"\nProcessing {meta.frame_count} frames @ {meta.fps}fps...\n")
 
-    for frame_idx, timestamp, frame in extract_frames(video_path, skip_frames=skip_frames):
+    for frame_idx, raw_timestamp, frame in extract_frames(video_path, skip_frames=skip_frames):
+        if raw_timestamp < start_timestamp:
+            # Pre-race frames (athletes still in blocks, before the gun) —
+            # nothing meaningful to track yet, skip to save compute.
+            continue
+
+        # All timestamps downstream of this point are RACE-RELATIVE (t=0 at start).
+        timestamp = raw_timestamp - start_timestamp
+
         # Update camera motion estimate every frame, BEFORE using it below
         motion_tracker.update(frame)
         if motion_tracker.last_inlier_ratio < 0.5:
@@ -235,6 +346,9 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
     print(occlusion_handler.report())
 
     print("\n=== Final Analysis ===\n")
+    print(f"(all times relative to start, method='{start_result.method}', "
+          f"confidence={start_result.confidence:.2f})\n")
+
     profiles = []
     # all_athletes_ever_tracked() includes both still-active AND archived
     # athletes, so a brief occlusion or finishing the race and leaving
@@ -246,6 +360,10 @@ def run_pipeline(video_path: str, skip_frames: int = 1, model_size: str = "yolov
         print(f"  Peak speed: {profile.peak_speed_mps:.2f} m/s ({profile.peak_speed_kmh:.1f} km/h)")
         print(f"  Average speed: {profile.average_speed_mps:.2f} m/s")
         print(f"  Frames tracked: {len(profile.data_points)}")
+        for split_distance in (10, 20, 30, 40, 50, 60, 70, 80, 90, 100):
+            split = profile.split_time(split_distance)
+            if split is not None:
+                print(f"  Split @ {split_distance}m: {split:.3f}s")
         print()
 
     if profiles:
