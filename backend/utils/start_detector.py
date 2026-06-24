@@ -147,22 +147,34 @@ def _parse_clock_text(text: str) -> Optional[float]:
         return None
 
 
-def _find_clock_start(readings: list, near_zero_threshold: float = 0.3,
-                       min_consecutive_increasing: int = 5) -> Optional[int]:
+def _find_clock_start(readings: list, min_consecutive_increasing: int = 5,
+                       jitter_tolerance: float = 0.02) -> Optional[int]:
     """
-    readings: [(frame_idx, timestamp, value_or_None), ...]
-    Finds a frame reading near-zero immediately followed by several frames
-    of strictly increasing values — that transition is the start trigger.
+    Finds the LAST frame still showing the static pre-race value (e.g. "0.00"),
+    immediately before a sustained run of increasing readings — i.e. the frame
+    right before the clock visibly starts counting up.
+
+    Uses frame-to-frame deltas rather than an absolute "near zero" threshold.
+    An absolute threshold doesn't work here: a real broadcast clock increments
+    at real-time speed (~0.033s per frame at 30fps), so it stays under almost
+    any reasonable absolute cutoff for the first several frames after the gun
+    too — which would bias the detected start time late. Comparing each frame
+    to the one before it sidesteps that entirely.
     """
     values = [r[2] for r in readings]
-    for i in range(len(values) - min_consecutive_increasing):
-        if values[i] is None or values[i] > near_zero_threshold:
+
+    for i in range(1, len(values) - min_consecutive_increasing):
+        if values[i] is None or values[i - 1] is None:
             continue
-        window = values[i + 1: i + 1 + min_consecutive_increasing]
+        if values[i] - values[i - 1] <= jitter_tolerance:
+            continue  # not a real increase yet — could just be OCR jitter
+
+        window = values[i: i + min_consecutive_increasing]
         if any(v is None for v in window):
             continue
         if all(window[j] < window[j + 1] for j in range(len(window) - 1)):
-            return i
+            return i - 1  # last frame still at the static pre-race value
+
     return None
 
 
